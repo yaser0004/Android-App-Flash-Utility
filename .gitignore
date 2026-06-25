@@ -2,8 +2,10 @@
 payload.bin
 payload_(or)_ROM-file/*
 !payload_(or)_ROM-file/.gitkeep
-input/
-output/
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
 
 # ── APKs (user-provided, third-party binaries, too large for git) ─────────────
 product/**/*.apk
