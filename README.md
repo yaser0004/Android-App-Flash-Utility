@@ -78,8 +78,9 @@ The `product` partition must be a *logical* partition managed by the Android log
 ```bash
 bash extract_payload.sh
 ```
-####    → writes input/product.img  (stock baseline)
-####    → writes output/vbmeta*.img (for the AVB step below)
+#####    → writes input/product.img  (stock baseline)
+#####    → writes output/vbmeta*.img (for the AVB step below)
+
 
 #### 2. Disable Android Verified Boot — ONE TIME per device
 (phone must be in fastboot mode; exact commands are printed by extract_payload.sh)
@@ -89,15 +90,20 @@ fastboot flash vbmeta_b   --disable-verity --disable-verification output/vbmeta.
 ```
 also flash vbmeta_system_a/b if your ROM has them (the script tells you)
 
+
 #### 3. Add your APKs to product/
 ```bash
 mkdir -p product/app/<App_Name>
 cp ~/Downloads/<App_Name>.apk product/app/<App_Name>/<App_Name>.apk
 ```
+
+
 #### 4. Inject into the image (requires root for loop-mounting ext4)
 ```bash
 sudo bash inject_apps.sh
 ```
+
+
 #### 5. Flash to phone — auto-detects fastbootd, A/B slots, reboots device
 ```bash
 bash flash_product.sh
