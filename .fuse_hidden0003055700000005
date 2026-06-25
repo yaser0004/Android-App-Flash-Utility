@@ -1,0 +1,515 @@
+# How to Install True System Apps on a Custom-ROM Android Device (Android 10+)
+### A complete beginner-to-advanced guide
+
+---
+
+## What are we actually doing here?
+
+When you install an app normally from the Play Store or a downloaded APK, Android puts it in `/data/app/`. Apps in that location:
+- Get wiped if you factory reset
+- Cannot be granted special "privileged" permissions
+- Can be uninstalled by anyone
+
+**System apps** live on a different storage partition — a read-only section of the phone's storage that Android reads at boot, before your personal data is even touched. They:
+- Survive factory resets
+- Survive ROM updates (as long as you re-apply this process after each ROM flash)
+- Can be granted powerful "privileged" permissions (so apps like AuroraStore can silently install other apps)
+- Cannot be removed without doing this whole process in reverse
+
+The partition we target is called `/product`. It was introduced in Android 10 as the dedicated home for manufacturer-added apps. On a custom ROM it's mostly empty, which means we have room to add our own. This approach works on Android 10 and later — tested on Android 16.
+
+**The method:** We take the stock `/product` partition image from the ROM's installer file, copy it, open the copy like a folder on our Linux PC, add our APKs directly, close it, then write it back to the phone using fastboot — the same low-level flashing tool used by ROM developers.
+
+---
+
+## Requirements
+
+### Your Linux PC needs:
+- **Ubuntu / Debian / Mint / any Linux distro** (this guide uses apt commands; adapt for your distro)
+- **Python 3** — `sudo apt install python3`
+- **ADB and Fastboot** — `sudo apt install android-tools-adb android-tools-fastboot`
+  - Or download [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools) and add to PATH
+- **unzip** — `sudo apt install unzip`
+- **e2fsprogs** (for resize2fs) — `sudo apt install e2fsprogs`
+- **[payload_dumper](https://github.com/rhythmcache/payload-dumper-rust)** — fast Rust-based OTA extractor; `extract_payload.sh` finds it automatically or installs it via pip if missing
+- **sudo access** — needed for the loop-mount step
+
+---
+
+### Your Android phone — required conditions (ALL must be true)
+
+> **These scripts do not unlock your bootloader or install a custom ROM for you. Every condition below must already be met before you run anything here.**
+
+**1. Bootloader is unlocked**
+The bootloader must be unlocked — this is a one-time hardware-level step done before flashing any custom software. On most devices: enable *OEM unlocking* in Developer Options, then run `fastboot flashing unlock`. This **wipes all data on the device**. Look up the unlock procedure for your specific device model before attempting.
+
+Not all devices support bootloader unlocking:
+- Many carrier-branded devices (especially US Verizon/AT&T variants) are permanently locked
+- Most Huawei/Honor devices lost unlock support in 2018
+- Some manufacturers require a token or account approval to unlock
+
+If your device cannot have its bootloader unlocked, these scripts **will not work**.
+
+**2. A custom ROM is installed**
+Stock/official OEM ROMs cryptographically verify every partition at boot using Android Verified Boot (AVB). Even after disabling AVB in fastboot, a stock ROM may refuse to boot from a modified partition, or may silently re-enable verification. A custom ROM (LineageOS, crDroid, PixelOS, Project Infinity-X, etc.) is required for reliable operation.
+
+**3. Dynamic (logical) partitions with A/B slots**
+The `/product` partition must be a *logical* partition managed by Android's dynamic partition system, and the device must use A/B (seamless) updates. This is standard on devices that launched with Android 10 or later. Devices that originally shipped on Android 9 or earlier, or A-only (single-slot) devices, may have a different layout and are untested.
+
+**4. USB debugging enabled and ADB authorized**
+`flash_product.sh` can reboot your device from Android into fastboot automatically over USB. For this to work, *USB debugging* must be enabled in Developer Options and the connected PC must be authorized (you must have accepted the ADB connection prompt on the phone at least once). If you prefer to reboot to fastboot manually, pass `--no-auto-reboot` to the flash script.
+
+> **How to check your Android version:** Settings → About Phone → Android version
+
+---
+
+## How the scripts work together
+
+```
+YOUR ROM ZIP
+    │
+    │  bash extract_payload.sh
+    ▼
+input/product.img ──────────────────────────── (stock, NEVER modified)
+    │                                                    │
+    │  sudo bash inject_apps.sh                          │ kept forever as clean baseline
+    │  (reads APKs from product/ folder)                 │
+    ▼
+output/product.img ─── bash flash_product.sh ──► YOUR PHONE ✓
+                                                (/product partition now has
+                                                 your apps as true system apps)
+
+extract_payload.sh also writes:
+output/vbmeta.img  ─── flash once (Step 2) ──► disables Android Verified Boot
+output/vbmeta_system.img  (if present in ROM)
+```
+
+**Key design:** `input/product.img` is your permanent stock baseline — it is never modified by any script. Every run of `inject_apps.sh` starts by copying it fresh to `output/product.img`, then injects your apps into the copy. This means:
+- Re-running always produces a clean, predictable result
+- Removing an app from `product/` actually removes it from the next output
+- You never need to re-extract from the ROM just to start fresh
+
+---
+
+## The files and folders in this directory
+
+```
+FLASHING/
+│
+├── README.md                     ← project overview
+├── GUIDE.md                      ← you are here
+│
+├── extract_payload.sh            ← STEP 1: extract images from ROM zip
+├── inject_apps.sh                ← STEP 2: inject APKs into product.img
+├── flash_product.sh              ← STEP 3: flash product.img to your phone
+│
+├── payload_(or)_ROM-file/        ← drop your ROM zip or payload.bin here
+│
+├── product/                      ← YOUR APK SOURCE TREE (edit this freely)
+│   ├── app/                      ← regular system apps go here
+│   │   └── NewPipe/
+│   │       └── NewPipe.apk
+│   └── priv-app/                 ← privileged system apps go here
+│       └── AuroraStore/
+│           └── AuroraStore.apk
+│
+├── input/                        ← stock image extracted from ROM (never modified)
+│   └── product.img
+│
+└── output/                       ← generated files (recreated every inject run)
+    ├── product.img               ← modified partition image, ready to flash
+    ├── vbmeta.img                ← extracted from ROM (flash once to disable AVB)
+    └── vbmeta_system.img         ← same (only present if the ROM includes it)
+```
+
+---
+
+## PART 1 — First-time setup for a new device
+
+Do this entire Part once per device. When you just want to update an app later, skip to Part 2.
+
+---
+
+### Step 0 — Get your ROM file
+
+Your ROM is distributed as a `.zip` file. Place it directly in the `payload_(or)_ROM-file/` folder:
+
+```bash
+cp ~/Downloads/your-rom-filename.zip /path/to/FLASHING/payload_(or)_ROM-file/
+```
+
+That's all — you don't need to open the zip or find `payload.bin` inside it. The extraction script handles everything.
+
+---
+
+### Step 1 — Extract partition images
+
+```bash
+cd /path/to/FLASHING/
+bash extract_payload.sh
+```
+
+The script automatically:
+- Finds your ROM zip (or `payload.bin`) in the `payload_(or)_ROM-file/` folder
+- Installs `payload_dumper` if it isn't on your system yet
+- Extracts `product.img` → `input/` (the stock baseline `inject_apps.sh` always starts from)
+- Extracts `vbmeta.img` and `vbmeta_system.img` → `output/` (for the one-time AVB disable flash)
+- Handles `vbmeta_system` being absent on some devices gracefully
+
+You'll see a summary at the end showing what was extracted and the exact fastboot commands to run next.
+
+> **What is payload.bin?** Modern Android A/B update packages store all partition data in a single binary called `payload.bin` inside the ROM zip. `payload_dumper` reads this format and extracts individual partition images directly from the zip — no need to unzip the ROM manually.
+
+> **If you already have a raw `payload.bin`**, just place it in `payload_(or)_ROM-file/payload.bin` — the script detects it automatically.
+
+---
+
+### Step 2 — Disable dm-verity (the phone's partition security)
+
+Android Verified Boot (AVB) cryptographically signs every partition so the phone can detect tampering. We need to disable this so the bootloader accepts our modified `product.img`.
+
+> **Important:** This only works if your bootloader is unlocked. On a custom ROM it always is. On stock firmware it usually isn't.
+
+**Boot your phone into fastboot mode:**
+```bash
+adb reboot bootloader
+# Or hold Power + Volume Down while booting (varies by device)
+```
+
+**Verify the device is visible:**
+```bash
+fastboot devices
+# Should print:  abae8b16    fastboot
+```
+
+**Disable verification on the vbmeta partitions:**
+```bash
+# Always: patch both slots of the main vbmeta
+fastboot flash vbmeta_a   --disable-verity --disable-verification output/vbmeta.img
+fastboot flash vbmeta_b   --disable-verity --disable-verification output/vbmeta.img
+
+# Only if output/vbmeta_system.img exists:
+fastboot flash vbmeta_system_a   --disable-verity --disable-verification output/vbmeta_system.img
+fastboot flash vbmeta_system_b   --disable-verity --disable-verification output/vbmeta_system.img
+
+# Reboot to confirm the phone still boots
+fastboot reboot
+```
+
+> **Why `_a` and `_b`?** A/B devices have two copies of every partition so they can update one while booting from the other. You must patch both.
+
+> **Why does `--disable-verity` come before the filename?** This is a fastboot quirk — the flags must precede the image path, otherwise they are silently ignored.
+
+You only need to do this **once per device**. AVB stays disabled across reboots and ROM updates (as long as you keep the patched vbmeta).
+
+---
+
+### Step 3 — Add your apps to the `product/` folder
+
+The `product/` folder is your APK source tree. Think of it like a blueprint — whatever is in here gets injected into the partition image.
+
+**`app/` vs `priv-app/` — which one to use:**
+
+| Use `app/` for | Use `priv-app/` for |
+|----------------|---------------------|
+| Any regular app | App stores (AuroraStore, F-Droid) |
+| Media players, browsers, note apps | VPN apps |
+| File managers, barcode scanners | Audio system tools (RootlessJamesDSP) |
+| Anything you just want pre-installed | Anything that installs/uninstalls other apps silently |
+
+When in doubt, use `app/`. The only real difference is that `priv-app/` apps can request special permissions that `app/` apps cannot.
+
+**To add a single APK:**
+```bash
+mkdir product/app/NewPipe
+cp ~/Downloads/NewPipe.apk product/app/NewPipe/NewPipe.apk
+```
+
+**To add a split APK bundle (`.apkm` from APKMirror):**
+```bash
+# 1. Rename .apkm to .zip and extract
+cp ~/Downloads/app.apkm /tmp/app.zip
+unzip /tmp/app.zip -d /tmp/app/
+
+# 2. Create the folder and copy all the APKs you want
+mkdir product/app/FirefoxFocus
+cp /tmp/app/base.apk                    product/app/FirefoxFocus/
+cp /tmp/app/split_config.arm64_v8a.apk  product/app/FirefoxFocus/
+cp /tmp/app/split_config.xxhdpi.apk     product/app/FirefoxFocus/   # optional, tiny
+```
+
+The script automatically skips architecture splits that don't match your device (e.g., `x86_64` splits on an ARM phone), so you can safely copy all `.apk` files from the bundle and let the script filter them.
+
+**To update an existing app:**
+```bash
+cp ~/Downloads/NewPipe-new-version.apk product/app/NewPipe/NewPipe.apk
+```
+
+**To remove an app from the system:**
+```bash
+rm -rf product/app/NewPipe
+# Next inject run will not include it
+```
+
+---
+
+### Step 4 — Inject the apps into the partition image
+
+Connect your phone via USB (optional — if connected, the script auto-detects your CPU type; if not, it uses sensible defaults).
+
+```bash
+sudo bash inject_apps.sh
+```
+
+The script does all of this automatically:
+- Detects your device's CPU architecture via ADB
+- Copies `input/product.img` → `output/product.img` (fresh start)
+- Calculates how much space is needed and **grows the partition if necessary**
+- Injects all compatible APKs
+- Pre-extracts native libraries (`.so` files) alongside each APK so they load correctly from the read-only partition
+- Sets correct Linux permissions and SELinux labels
+
+You'll see output like:
+```
+  ABI detected from connected device: arm64-v8a armeabi-v7a armeabi
+
+==> Preparing output image...
+  Copying 1.2G  input/product.img → output/product.img
+  Done.
+
+==> Checking space requirements...
+  Net new data needed : 450 MB
+  Free space in image : 580 MB
+  Sufficient space — no resize needed
+
+Mounted output/product.img → /mnt/product_edit
+
+==> Injecting app/
+  + app/NewPipe  (none)
+  + app/FirefoxFocus  (arm64-v8a) [split: 3 APKs]
+    extracted native libs → lib/
+  SKIP (ABI x86_64 not in {arm64-v8a ...}): SomeX86OnlyApp
+
+==> Injecting priv-app/
+  + priv-app/AuroraStore  (none)
+
+==> Done. Unmounted cleanly.
+    Installed : 3 apps
+    Skipped   : 1 apps (ABI-incompatible)
+```
+
+**What "SKIP (ABI)" means:** The APK contains native code compiled only for a CPU your phone doesn't have. An x86-only app would crash instantly on an ARM phone. Replace it with a universal or arm64 build.
+
+**If the partition needs to grow** (your apps are larger than the stock free space), the script handles it automatically — you'll see an `Auto-growing image by X MB` message. No manual steps needed.
+
+---
+
+### Step 5 — Flash the image to your phone
+
+```bash
+bash flash_product.sh
+```
+
+That's it. The script handles everything:
+- If your phone is in Android mode, it reboots it to fastboot automatically
+- Switches to fastbootd (userspace fastboot) if your device uses dynamic partitions
+- Detects whether your device has A/B slots and flashes both
+- Reboots the phone when done
+
+**First boot is slow — this is completely normal.** Android compiles ("dex-optimizes") every new system app during first boot. With many large apps this can take 2–5 minutes. The boot animation will loop. Do not panic.
+
+---
+
+## PART 2 — Adding, updating, or removing an app
+
+After the one-time setup, this is all you need:
+
+```bash
+# Add or update: copy the new APK into place
+cp ~/Downloads/NewPipe-new-version.apk product/app/NewPipe/NewPipe.apk
+
+# Remove: delete the folder
+rm -rf product/app/OldApp
+
+# Re-inject and flash
+sudo bash inject_apps.sh
+bash flash_product.sh
+```
+
+Because `inject_apps.sh` always starts fresh from `input/product.img`, removing a folder from `product/` actually removes that app from the output image. No manual cleanup needed.
+
+---
+
+## PART 3 — After a ROM update
+
+When you flash a new ROM version, the `/product` partition is overwritten. Your apps are gone. Here's how to get them back:
+
+```bash
+# 1. Drop the new ROM zip into payload_(or)_ROM-file/ (replacing the old one)
+cp ~/Downloads/new-rom.zip /path/to/FLASHING/payload_(or)_ROM-file/
+
+# 2. Re-extract (overwrites input/product.img and output/vbmeta*.img)
+bash extract_payload.sh
+
+# 3. Re-patch vbmeta (same commands as original Step 2)
+#    Boot phone into fastboot first, then:
+fastboot flash vbmeta_a   --disable-verity --disable-verification output/vbmeta.img
+fastboot flash vbmeta_b   --disable-verity --disable-verification output/vbmeta.img
+
+# 4. Re-inject your apps (product/ folder is untouched — all your APKs are still there)
+sudo bash inject_apps.sh
+
+# 5. Flash
+bash flash_product.sh
+```
+
+Your `product/` folder is never touched by any script, so your entire app collection is always preserved across ROM updates.
+
+---
+
+## PART 4 — Using this on a different device
+
+Almost everything works identically on any supported Android device with an unlocked bootloader.
+
+**1. Get that device's ROM zip** — drop it in `payload_(or)_ROM-file/` and run `bash extract_payload.sh`, same as the first-time setup.
+
+**2. Run the same Steps 1–5** — the scripts auto-detect everything: CPU type, slot count, partition type.
+
+**3. Potential gotcha — no `/product` partition (Android 9 or earlier):**
+Android 10 introduced `/product`. Devices on Android 9 or earlier use `/system/app/` instead. These scripts target `/product` only.
+
+**4. Potential gotcha — `vbmeta_system` doesn't exist:**
+Not all devices have one. Just skip those flash commands.
+
+---
+
+## PART 5 — Partition growth (handled automatically)
+
+The stock `/product` image has a fixed size. If your apps exceed the free space, the injection would fail. The script detects this automatically and grows the image before injecting.
+
+**You do not need to do anything manually.** The script:
+1. Calculates the net new bytes your apps require (comparing against what's already in the image)
+2. Adds an 80 MB safety buffer
+3. Grows the image with `truncate` + `e2fsck` + `resize2fs` if needed
+4. When you flash, fastbootd automatically resizes the on-device logical partition to match
+
+You'll see a message like:
+```
+==> Auto-growing image by 128 MB...
+  Image is now 1.4G
+```
+
+**Background — why this works:**
+The `/product` partition is a *logical* partition inside a larger container called `super`. Logical partitions can be resized dynamically. The stock size is whatever the ROM developer chose, but you can grow it up to however much free space is left in `super`. On most custom ROMs there is 500 MB–1.5 GB of headroom.
+
+**Incremental builds:**
+If you want to stack builds (use a previous output as the new baseline instead of the stock image), copy the output back to input:
+```bash
+cp output/product.img input/product.img
+```
+The next inject run will start from this modified baseline.
+
+---
+
+## Troubleshooting
+
+**`inject_apps.sh`: "Input image not found: input/product.img"**
+You haven't extracted `product.img` yet. Place your ROM zip in `payload_(or)_ROM-file/` and run:
+```bash
+bash extract_payload.sh
+```
+
+**"mount: /mnt/product_edit: can't read superblock"**
+The image file is corrupt. Re-extract a fresh copy:
+```bash
+bash extract_payload.sh
+```
+
+**"inject_apps.sh: pre-scan mount failed — is the image already mounted?"**
+A previous run crashed and left the image mounted. Unmount it:
+```bash
+sudo umount /mnt/product_edit
+```
+
+**"fastboot: Partition not found" when flashing manually**
+You're in bootloader fastboot but your device uses dynamic partitions. Switch to fastbootd first:
+```bash
+fastboot reboot fastboot    # enters fastbootd (userspace fastboot)
+fastboot flash product_a output/product.img
+```
+`flash_product.sh` handles this automatically — use the script instead of manual fastboot commands.
+
+**Apps crash immediately on open**
+Two likely causes:
+1. **Missing native library** — the APK was a split bundle and you only copied `base.apk` without the architecture split (`split_config.arm64_v8a.apk`). Add the missing split to the app's folder and re-inject.
+2. **ABI mismatch** — the APK has native code built only for x86. Get an arm64 or universal build.
+
+**"FAILED (remote: 'This partition doesn't exist')" for vbmeta_system**
+Your device doesn't have a `vbmeta_system` partition. Skip those two flash commands — only flash `vbmeta_a` and `vbmeta_b`.
+
+**Phone bootloops after flashing**
+The image is likely corrupted or ran out of space mid-injection. Re-extract a clean stock image and retry:
+```bash
+bash extract_payload.sh
+# Remove some APKs from product/ if space was the issue, then:
+sudo bash inject_apps.sh
+bash flash_product.sh
+```
+
+**First boot takes forever (>10 minutes)**
+Give it up to 15 minutes on slower phones with many large APKs. If it genuinely never finishes, force reboot (hold Power 10 seconds) and check if the system boots normally on the next attempt.
+
+**Apps installed but device shows them as "not installed" or can't be opened**
+If you previously had a user-installed version of the same app, there can be a signature conflict. Uninstall the user version first:
+```bash
+adb shell pm uninstall com.package.name.here
+```
+
+---
+
+## Quick reference card
+
+```bash
+# ── ONE-TIME SETUP PER DEVICE ────────────────────────────────────────────────
+
+# Drop ROM zip (or payload.bin) into payload_(or)_ROM-file/ folder, then:
+bash extract_payload.sh     # extracts product.img → input/, vbmeta → output/
+
+# Disable AVB (phone must be in fastboot mode)
+fastboot flash vbmeta_a   --disable-verity --disable-verification output/vbmeta.img
+fastboot flash vbmeta_b   --disable-verity --disable-verification output/vbmeta.img
+# Only if vbmeta_system.img exists:
+fastboot flash vbmeta_system_a   --disable-verity --disable-verification output/vbmeta_system.img
+fastboot flash vbmeta_system_b   --disable-verity --disable-verification output/vbmeta_system.img
+fastboot reboot
+
+# ── MANAGE YOUR APPS (edit product/ freely) ──────────────────────────────────
+
+# Add a regular app:
+mkdir product/app/AppName
+cp app.apk product/app/AppName/AppName.apk
+
+# Add a split APK bundle (from .apkm / APKMirror):
+mkdir product/app/AppName
+cp base.apk split_config.arm64_v8a.apk product/app/AppName/
+# Copy all .apk files — script auto-skips wrong-architecture splits
+
+# Update: cp new-version.apk product/app/AppName/AppName.apk
+# Remove: rm -rf product/app/AppName
+
+# ── INJECT + FLASH ───────────────────────────────────────────────────────────
+
+sudo bash inject_apps.sh       # fresh copy of input + inject product/ → output/
+bash flash_product.sh          # auto-reboots phone, handles fastbootd + A/B slots
+
+# ── AFTER A ROM UPDATE ───────────────────────────────────────────────────────
+
+# Drop the new ROM zip into payload_(or)_ROM-file/ and re-extract
+bash extract_payload.sh
+
+# Re-patch vbmeta (same commands as one-time setup above)
+
+# Re-inject and flash (product/ folder is untouched)
+sudo bash inject_apps.sh
+bash flash_product.sh
+```
