@@ -1,0 +1,24 @@
+# ── Large ROM images (user-provided, device-specific) ────────────────────────
+payload.bin
+payload_(or)_ROM-file/*
+!payload_(or)_ROM-file/.gitkeep
+input/
+output/
+
+# ── APKs (user-provided, third-party binaries, too large for git) ─────────────
+product/**/*.apk
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+tools/__pycache__/
+**/__pycache__/
+*.pyc
+
+# ── Session/tool private state ────────────────────────────────────────────────
+.remember/
+
+# ── Personal files ────────────────────────────────────────────────────────────
+*.jpeg
+*.jpg
+*.png
