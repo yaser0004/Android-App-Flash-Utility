@@ -81,12 +81,17 @@ fi
 
 # ── wait for a fastboot device ────────────────────────────────────────────────
 echo "==> Waiting for fastboot device (up to 60 s)..."
-timeout 60 fastboot wait-for-device 2>/dev/null \
-  || die "No fastboot device appeared after 60 seconds.
+_waited=0
+until fastboot devices 2>/dev/null | grep -q "fastboot"; do
+  sleep 2; _waited=$(( _waited + 2 ))
+  if [ "$_waited" -ge 60 ]; then
+    die "No fastboot device appeared after 60 seconds.
   Make sure the device is connected via USB, then either:
     In Android: plug in and retry (the script reboots it automatically)
     Already in fastboot: check 'fastboot devices' in a terminal
     Manually: hold Power + Volume Down while booting (varies by device)"
+  fi
+done
 DEV="$(fastboot devices 2>/dev/null | head -n1 | awk '{print $1}')"
 echo "  Device: $DEV"
 

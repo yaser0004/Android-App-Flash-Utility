@@ -128,26 +128,52 @@ split_abi_from_name() {
 }
 
 # Pre-extract native libs from all APKs in a destination directory.
-# Places .so files in lib/<abi>/ alongside the APK, mirroring how AOSP ships
-# its own system apps. Required because /product is read-only at runtime —
-# Android cannot extract libs there itself, causing UnsatisfiedLinkError crashes.
+#
+# For regular system apps (product/app/): places .so files in lib/<abi>/ alongside
+# the APK.  Android's PackageManager sets nativeLibraryDir from this path and the
+# linker finds the library via that full path.
+#
+# For privileged system apps (product/priv-app/): PackageManager does NOT use the
+# app-local lib/<abi>/ directory to set nativeLibraryDir for privileged packages.
+# The linker's [product] namespace searches /product/lib64/ (or /product/lib/) by
+# default, so bare-name dlopen("libfoo.so") calls would fail otherwise.  Fix: copy
+# the .so files to the partition's shared lib dir, exactly as AOSP's build system
+# does for its own priv-apps (e.g. LatinIME uses symlinks into /product/lib64/).
+# We keep the lib/<abi>/ dir too so PMS can detect primaryCpuAbi.
 extract_native_libs() {
   local dest="$1"
+  local is_priv=0
+  case "$dest" in */priv-app/*) is_priv=1 ;; esac
+
   local extracted=0
+  local _plibdir=""
   for _apk in "$dest"/*.apk; do
     [ -f "$_apk" ] || continue
     for _abi in $DEV_ABIS; do
-      # Check if this APK has any .so for this ABI
       _has_so="$(unzip -l "$_apk" 2>/dev/null | grep "lib/$_abi/.*\.so" || true)"
       [ -z "$_has_so" ] && continue
+
       mkdir -p "$dest/lib/$_abi"
       unzip -j -o "$_apk" "lib/$_abi/*.so" -d "$dest/lib/$_abi/" 2>/dev/null || true
+
+      if [ "$is_priv" = "1" ]; then
+        case "$_abi" in
+          arm64-v8a|x86_64) _plibdir="$MNT/lib64" ;;
+          *)                 _plibdir="$MNT/lib"   ;;
+        esac
+        mkdir -p "$_plibdir"
+        for _so in "$dest/lib/$_abi"/*.so; do
+          [ -f "$_so" ] || continue
+          cp "$_so" "$_plibdir/$(basename "$_so")"
+        done
+      fi
+
       extracted=$(( extracted + 1 ))
       break  # only extract for the first (primary) matching ABI per APK
     done
   done
+
   if [ "$extracted" -gt 0 ]; then
-    # Fix perms on extracted .so files
     find "$dest/lib" -type f -exec chmod 0644 {} +
     find "$dest/lib" -type d -exec chmod 0755 {} +
     chown -R 0:0 "$dest/lib"
@@ -162,6 +188,19 @@ for root, dirs, files in os.walk(sys.argv[1]):
         except Exception: pass
 " "$dest/lib"
     say "  extracted native libs → lib/"
+
+    if [ "$is_priv" = "1" ] && [ -n "$_plibdir" ]; then
+      find "$_plibdir" -maxdepth 1 -name "*.so" -exec chmod 0644 {} + 2>/dev/null || true
+      find "$_plibdir" -maxdepth 1 -name "*.so" -exec chown 0:0 {} + 2>/dev/null || true
+      python3 -c "
+import os, sys, glob
+ctx = b'u:object_r:system_file:s0\x00'
+for f in glob.glob(sys.argv[1] + '/*.so'):
+    try: os.setxattr(f, 'security.selinux', ctx, follow_symlinks=False)
+    except Exception: pass
+" "$_plibdir" 2>/dev/null || true
+      say "  → also copied to $(basename "$_plibdir")/ (priv-app: linker search path workaround)"
+    fi
   fi
 }
 
@@ -268,13 +307,13 @@ for xml in "$PRODUCT_SRC/etc/permissions"/*.xml; do
   fi
 done
 
-# Read free space (df reports Available in 1K blocks; multiply to bytes)
+# Read free space (df reports Available in 1K blocks; multiply to bytes).
+# Keep empty string as-is — empty means df failed; "0" means genuinely full.
 FREE_BYTES="$(df -k "$MNT" 2>/dev/null \
   | awk 'END{for(j=1;j<=NF;j++) if($j ~ /%$/){print $(j-1)*1024; exit}}')"
-[ -z "$FREE_BYTES" ] && FREE_BYTES=0
 
 NET_MB=$(( NET_NEEDED / 1024 / 1024 ))
-FREE_MB=$(( FREE_BYTES / 1024 / 1024 ))
+FREE_MB=$(( ${FREE_BYTES:-0} / 1024 / 1024 ))
 say "Net new data needed : ${NET_MB} MB"
 say "Free space in image : ${FREE_MB} MB"
 
@@ -282,7 +321,7 @@ umount "$MNT"
 
 # ── grow image if needed (80 MB safety buffer) ────────────────────────────────
 BUFFER=$(( 80 * 1024 * 1024 ))
-if [ "$FREE_BYTES" -eq 0 ]; then
+if [ -z "$FREE_BYTES" ]; then
   say "WARNING: could not read free space — skipping auto-grow check"
   say "(If injection fails with 'no space left on device', see GUIDE.md Part 5)"
 elif [ $(( NET_NEEDED + BUFFER )) -gt "$FREE_BYTES" ]; then
