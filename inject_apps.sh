@@ -17,11 +17,15 @@
 #
 # Every run starts fresh: input/product.img is copied to output/product.img,
 # then the copy is modified. input/product.img is never touched.
-# To do incremental builds on top of a previous output, copy the output back:
-#   cp output/product.img input/product.img
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# ── logging ───────────────────────────────────────────────────────────────────
+LOG_DIR="$HERE/Logs"
+mkdir -p "$LOG_DIR"
+LOGFILE="$LOG_DIR/Logs_$(date '+%d-%m-%Y_%H:%M:%S').txt"
+exec > >(tee "$LOGFILE") 2>&1
 
 # ── defaults (overridable via flags) ─────────────────────────────────────────
 INPUT_IMG="$HERE/input/product.img"
@@ -48,12 +52,24 @@ done
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo "  $*"; }
 
+echo "  Log: $LOGFILE"
+echo ""
+
+# ── pre-flight checks ────────────────────────────────────────────────────────
 [ -f "$INPUT_IMG" ]   || die "Input image not found: $INPUT_IMG
-  Run:  bash extract_payload.sh   (place your ROM zip in payload/ first)"
+  Run:  bash extract_payload.sh   (place your ROM zip in payload_(or)_ROM-file/ first)"
 [ -d "$PRODUCT_SRC" ] || die "Source dir not found: $PRODUCT_SRC"
+
+# Validate the input image is a real ext4 filesystem before we do anything with it
+tune2fs -l "$INPUT_IMG" >/dev/null 2>&1 \
+  || die "Input image does not appear to be a valid ext4 filesystem: $INPUT_IMG
+  Re-run:  bash extract_payload.sh"
+
 command -v python3   >/dev/null 2>&1 || die "python3 required  (sudo apt install python3)"
 command -v unzip     >/dev/null 2>&1 || die "unzip required    (sudo apt install unzip)"
+command -v e2fsck    >/dev/null 2>&1 || die "e2fsck required   (sudo apt install e2fsprogs)"
 command -v resize2fs >/dev/null 2>&1 || die "resize2fs required (sudo apt install e2fsprogs)"
+command -v tune2fs   >/dev/null 2>&1 || die "tune2fs required  (sudo apt install e2fsprogs)"
 
 # ── auto-detect ABI from connected ADB device ────────────────────────────────
 if [ -z "$DEV_ABIS" ]; then
@@ -67,7 +83,11 @@ if [ -z "$DEV_ABIS" ]; then
   fi
 fi
 if [ -z "$DEV_ABIS" ]; then
-  DEV_ABIS="arm64-v8a armeabi-v7a armeabi"
+  # Last resort: inspect the image for lib64/ vs lib/ to guess ABI family
+  if tune2fs -l "$INPUT_IMG" 2>/dev/null | grep -q ""; then
+    # Can't inspect without mounting; default to arm64 + 32-bit compat
+    DEV_ABIS="arm64-v8a armeabi-v7a armeabi"
+  fi
   say "No ADB device detected — using default ABIs: $DEV_ABIS"
   say "(Override: --abis \"list\" or DEV_ABIS=... sudo bash inject_apps.sh)"
 fi
@@ -83,7 +103,6 @@ echo ""
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-# Extract the comma-list of native ABIs from a single APK (or "none" if pure Java)
 apk_abis() {
   local apk="$1" abis
   abis="$(unzip -l "$apk" 2>/dev/null | grep -oE 'lib/[^/]+/' | sed 's|lib/||;s|/||' | sort -u | paste -sd, - || true)"
@@ -91,15 +110,11 @@ apk_abis() {
   printf '%s' "$abis"
 }
 
-# Detect the ABIs represented by all APKs in a folder.
-# Handles both single APKs and split APK bundles (APKM/APKS).
-# Checks ABI hints in split filenames first (fast), then APK internals.
 folder_abis() {
   local dir="$1" apk bname abis
   for apk in "$dir"*.apk; do
     [ -f "$apk" ] || continue
     bname="$(basename "$apk")"
-    # split_config.<abi>.apk filenames are definitive ABI indicators
     case "$bname" in
       *arm64_v8a*|*arm64-v8a*) printf 'arm64-v8a';   return ;;
       *armeabi_v7a*|*armeabi-v7a*) printf 'armeabi-v7a'; return ;;
@@ -107,15 +122,12 @@ folder_abis() {
       *x86*)                    printf 'x86';        return ;;
       *armeabi*)                printf 'armeabi';    return ;;
     esac
-    # fallback: inspect the APK's lib/ entries
     abis="$(apk_abis "$apk")"
     [ "$abis" != "none" ] && { printf '%s' "$abis"; return; }
   done
-  printf 'none'  # no native code found — pure Java, always compatible
+  printf 'none'
 }
 
-# If a filename is an architecture split (split_config.<abi>.apk), return that ABI.
-# Returns "none" for base.apk, density splits, language splits, and regular APKs.
 split_abi_from_name() {
   case "$1" in
     *arm64_v8a*|*arm64-v8a*) printf 'arm64-v8a'   ;;
@@ -123,23 +135,10 @@ split_abi_from_name() {
     *x86_64*)                 printf 'x86_64'     ;;
     *x86*)                    printf 'x86'        ;;
     *armeabi*)                printf 'armeabi'    ;;
-    *)                        printf 'none'       ;;  # base.apk, dpi, lang splits
+    *)                        printf 'none'       ;;
   esac
 }
 
-# Pre-extract native libs from all APKs in a destination directory.
-#
-# For regular system apps (product/app/): places .so files in lib/<abi>/ alongside
-# the APK.  Android's PackageManager sets nativeLibraryDir from this path and the
-# linker finds the library via that full path.
-#
-# For privileged system apps (product/priv-app/): PackageManager does NOT use the
-# app-local lib/<abi>/ directory to set nativeLibraryDir for privileged packages.
-# The linker's [product] namespace searches /product/lib64/ (or /product/lib/) by
-# default, so bare-name dlopen("libfoo.so") calls would fail otherwise.  Fix: copy
-# the .so files to the partition's shared lib dir, exactly as AOSP's build system
-# does for its own priv-apps (e.g. LatinIME uses symlinks into /product/lib64/).
-# We keep the lib/<abi>/ dir too so PMS can detect primaryCpuAbi.
 extract_native_libs() {
   local dest="$1"
   local is_priv=0
@@ -157,6 +156,8 @@ extract_native_libs() {
       unzip -j -o "$_apk" "lib/$_abi/*.so" -d "$dest/lib/$_abi/" 2>/dev/null || true
 
       if [ "$is_priv" = "1" ]; then
+        # Privileged apps: PMS does not set nativeLibraryDir from lib/<abi>/.
+        # Copy to partition shared lib dir (/product/lib64/) so bare-name dlopen works.
         case "$_abi" in
           arm64-v8a|x86_64) _plibdir="$MNT/lib64" ;;
           *)                 _plibdir="$MNT/lib"   ;;
@@ -169,7 +170,7 @@ extract_native_libs() {
       fi
 
       extracted=$(( extracted + 1 ))
-      break  # only extract for the first (primary) matching ABI per APK
+      break
     done
   done
 
@@ -199,7 +200,7 @@ for f in glob.glob(sys.argv[1] + '/*.so'):
     try: os.setxattr(f, 'security.selinux', ctx, follow_symlinks=False)
     except Exception: pass
 " "$_plibdir" 2>/dev/null || true
-      say "  → also copied to $(basename "$_plibdir")/ (priv-app: linker search path workaround)"
+      say "  → also copied to $(basename "$_plibdir")/ (priv-app linker workaround)"
     fi
   fi
 }
@@ -213,7 +214,6 @@ abi_compatible() {
   return 1
 }
 
-# Set root ownership, standard permissions, and SELinux xattr on a path tree
 fix() {
   local path="$1"
   chown -R 0:0 "$path"
@@ -231,25 +231,49 @@ for root, dirs, files in os.walk(sys.argv[1]):
 " "$path"
 }
 
-# Grow the image by at least $1 bytes, rounded up to the nearest 64 MB
+# Grow the image by at least $1 bytes, rounded up to the nearest 64 MB.
+# Aborts on any tool failure — a half-grown image is worse than no image.
 grow_image() {
   local deficit="$1"
   local mb64=$((64 * 1024 * 1024))
   local grow=$(( ( (deficit + mb64 - 1) / mb64 ) * mb64 ))
   local grow_mb=$(( grow / 1024 / 1024 ))
-  echo "==> Auto-growing image by ${grow_mb} MB..."
-  truncate -s "+${grow}" "$OUTPUT_IMG"
-  # e2fsck exit code 1 means "errors corrected" — that is success, not failure
-  e2fsck -f -p "$OUTPUT_IMG" 2>&1 || true
-  resize2fs "$OUTPUT_IMG" 2>&1
+  local host_free
+  host_free="$(df -h "$(dirname "$OUTPUT_IMG")" 2>/dev/null | tail -1 | awk '{print $4}')"
+  echo "==> Auto-growing image by ${grow_mb} MB (host has ${host_free:-?} free)..."
+  truncate -s "+${grow}" "$OUTPUT_IMG" \
+    || die "truncate failed — not enough disk space on host? (need ~${grow_mb} MB free)"
+  # e2fsck exit 0 = clean, 1 = errors corrected (both acceptable); 2+ = serious
+  local _fsck_rc=0
+  e2fsck -f -p "$OUTPUT_IMG" 2>&1 || _fsck_rc=$?
+  if [ "$_fsck_rc" -gt 1 ]; then
+    die "e2fsck reported serious filesystem errors (exit $_fsck_rc).
+  The image may be corrupt. Restore from: $INPUT_IMG"
+  fi
+  resize2fs "$OUTPUT_IMG" 2>&1 \
+    || die "resize2fs failed — e2fsprogs may be outdated (sudo apt install --reinstall e2fsprogs)"
   say "Image is now $(du -h "$OUTPUT_IMG" | cut -f1)"
   echo ""
 }
 
-# ── phase 1: pre-scan (read-only mount) to calculate net new bytes needed ────
-# Ensure the loop mount is always released on exit, even if the script crashes
-trap 'umount "$MNT" 2>/dev/null || true' EXIT
+# ── exit trap: unmount and delete incomplete output to prevent bad flashes ────
+INJECT_SUCCESS=0
+_cleanup() {
+  local _ec=$?
+  umount "$MNT" 2>/dev/null || true
+  # Wait for the tee log process to flush before exiting
+  wait 2>/dev/null || true
+  if [ "$INJECT_SUCCESS" = "0" ] && [ "$_ec" -ne 0 ]; then
+    echo "" >&2
+    echo "  ABORTED (exit $_ec) — removing incomplete output image to prevent a bad flash." >&2
+    rm -f "$OUTPUT_IMG" 2>/dev/null || true
+    echo "  Safe to re-run: sudo bash inject_apps.sh" >&2
+    echo "  Log saved: $LOGFILE" >&2
+  fi
+}
+trap '_cleanup' EXIT
 
+# ── phase 1: pre-scan (read-only mount) to calculate net new bytes needed ────
 echo "==> Checking space requirements..."
 mkdir -p "$MNT"
 mount -o loop,ro "$OUTPUT_IMG" "$MNT" 2>/dev/null \
@@ -257,32 +281,25 @@ mount -o loop,ro "$OUTPUT_IMG" "$MNT" 2>/dev/null \
 
 NET_NEEDED=0
 
-# Scan app/ and priv-app/ together
 for d in "$PRODUCT_SRC/app"/*/ "$PRODUCT_SRC/priv-app"/*/; do
   [ -d "$d" ] || continue
   folder="$(basename "$d")"
   case "$d" in */priv-app/*) ptype="priv-app" ;; *) ptype="app" ;; esac
 
-  # Must have at least one APK
   _has_apk=0
   for _f in "$d"*.apk; do [ -f "$_f" ] && _has_apk=1 && break; done
   [ "$_has_apk" = "1" ] || continue
 
-  abi_compatible "$(folder_abis "$d")" || continue   # skip ABI-incompatible
+  abi_compatible "$(folder_abis "$d")" || continue
 
-  # Sum ALL APKs in source folder (handles split bundles)
-  # Also add estimated native lib extraction size (libs are stored compressed in APK,
-  # so extracted .so files will be larger — use uncompressed size from zip header)
   new_sz=0
   for _apk in "$d"*.apk; do
     [ -f "$_apk" ] || continue
     new_sz=$(( new_sz + $(stat -c %s "$_apk") ))
-    # Add uncompressed size of arm64 .so files (they'll be pre-extracted alongside APK)
     _so_sz="$(unzip -v "$_apk" 2>/dev/null | awk '/lib\/arm64/{sum+=$1} END{print sum+0}')"
     new_sz=$(( new_sz + _so_sz ))
   done
 
-  # Sum existing APKs already in image (for accurate delta)
   ex_sz=0
   for _apk in "$MNT/$ptype/$folder/"*.apk; do
     [ -f "$_apk" ] && ex_sz=$(( ex_sz + $(stat -c %s "$_apk") ))
@@ -292,7 +309,6 @@ for d in "$PRODUCT_SRC/app"/*/ "$PRODUCT_SRC/priv-app"/*/; do
   [ "$delta" -gt 0 ] && NET_NEEDED=$(( NET_NEEDED + delta ))
 done
 
-# Scan permission XMLs
 for xml in "$PRODUCT_SRC/etc/permissions"/*.xml; do
   [ -f "$xml" ] || continue
   fname="$(basename "$xml")"
@@ -307,8 +323,7 @@ for xml in "$PRODUCT_SRC/etc/permissions"/*.xml; do
   fi
 done
 
-# Read free space (df reports Available in 1K blocks; multiply to bytes).
-# Keep empty string as-is — empty means df failed; "0" means genuinely full.
+# Read free space. Empty string = df parse failed; "0" = filesystem genuinely full.
 FREE_BYTES="$(df -k "$MNT" 2>/dev/null \
   | awk 'END{for(j=1;j<=NF;j++) if($j ~ /%$/){print $(j-1)*1024; exit}}')"
 
@@ -322,13 +337,14 @@ umount "$MNT"
 # ── grow image if needed (80 MB safety buffer) ────────────────────────────────
 BUFFER=$(( 80 * 1024 * 1024 ))
 if [ -z "$FREE_BYTES" ]; then
-  say "WARNING: could not read free space — skipping auto-grow check"
-  say "(If injection fails with 'no space left on device', see GUIDE.md Part 5)"
+  # df parse failed (no output) — grow conservatively so we don't run out
+  say "WARNING: could not read free space from df — growing by net needed + buffer"
+  grow_image $(( NET_NEEDED + BUFFER ))
 elif [ $(( NET_NEEDED + BUFFER )) -gt "$FREE_BYTES" ]; then
   DEFICIT=$(( NET_NEEDED + BUFFER - FREE_BYTES ))
   grow_image "$DEFICIT"
 else
-  say "Sufficient space — no resize needed"
+  say "Sufficient space (${FREE_MB} MB free, need ${NET_MB} MB + 80 MB buffer) — no resize needed"
   echo ""
 fi
 
@@ -424,10 +440,15 @@ for xml in "$PRODUCT_SRC/etc/permissions"/*.xml; do
   chmod 0644 "$MNT/etc/permissions/$fname"
   python3 -c "
 import os, sys
-os.setxattr(sys.argv[1], 'security.selinux', b'u:object_r:system_file:s0\x00', follow_symlinks=False)
+try: os.setxattr(sys.argv[1], 'security.selinux', b'u:object_r:system_file:s0\x00', follow_symlinks=False)
+except Exception: pass
 " "$MNT/etc/permissions/$fname"
   say "+ etc/permissions/$fname"
 done
+
+# ── all injection done — mark success before unmount ─────────────────────────
+# Set this before sync/umount so a signal during cleanup doesn't delete a good image
+INJECT_SUCCESS=1
 
 # ── final space check ─────────────────────────────────────────────────────────
 echo ""
@@ -441,6 +462,6 @@ echo ""
 echo "==> Done. Unmounted cleanly."
 echo "    Installed : $INSTALLED apps"
 echo "    Skipped   : $SKIPPED apps (ABI-incompatible)"
+echo "    Log saved : $LOGFILE"
 echo ""
 echo "    Next: run  bash flash_product.sh"
-echo "    (auto-detects your device, reboots to fastboot, and flashes automatically)"

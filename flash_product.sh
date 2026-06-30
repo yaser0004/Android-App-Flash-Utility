@@ -22,6 +22,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# ── logging ───────────────────────────────────────────────────────────────────
+LOG_DIR="$HERE/Logs"
+mkdir -p "$LOG_DIR"
+LOGFILE="$LOG_DIR/Logs_$(date '+%d-%m-%Y_%H:%M:%S').txt"
+exec > >(tee "$LOGFILE") 2>&1
+
 IMG="$HERE/output/product.img"
 SLOT_OVERRIDE=""
 DRY_RUN=0
@@ -51,7 +58,20 @@ run() {
   fi
 }
 
-[ -f "$IMG" ] || die "Image not found: $IMG"
+echo "  Log: $LOGFILE"
+
+# ── pre-flight: validate image ───────────────────────────────────────────────
+[ -f "$IMG" ] || die "Image not found: $IMG
+  This usually means inject_apps.sh failed or was not run yet.
+  Run:  sudo bash inject_apps.sh"
+
+# Verify the image is a real ext4 filesystem, not a partial or corrupt file
+if ! tune2fs -l "$IMG" >/dev/null 2>&1; then
+  die "Image is not a valid ext4 filesystem: $IMG
+  inject_apps.sh may have failed or been interrupted.
+  Re-run:  sudo bash inject_apps.sh"
+fi
+
 command -v fastboot >/dev/null 2>&1 || die "fastboot not found — install android-tools-fastboot (or platform-tools)"
 
 echo ""
@@ -87,38 +107,40 @@ until fastboot devices 2>/dev/null | grep -q "fastboot"; do
   if [ "$_waited" -ge 60 ]; then
     die "No fastboot device appeared after 60 seconds.
   Make sure the device is connected via USB, then either:
-    In Android: plug in and retry (the script reboots it automatically)
-    Already in fastboot: check 'fastboot devices' in a terminal
-    Manually: hold Power + Volume Down while booting (varies by device)"
+    • Already in fastboot: check 'fastboot devices' in a terminal
+    • In Android: plug in and retry (the script reboots it automatically)
+    • Manually: hold Power + Volume Down while booting (varies by device)"
   fi
 done
 DEV="$(fastboot devices 2>/dev/null | head -n1 | awk '{print $1}')"
-echo "  Device: $DEV"
+say "Device: $DEV"
 
 # ── detect if we're in userspace fastboot (fastbootd) ────────────────────────
 IS_USERSPACE="$(fastboot getvar is-userspace 2>&1 | grep '^is-userspace:' | awk '{print $2}' || true)"
-echo "  is-userspace (fastbootd?): ${IS_USERSPACE:-no}"
+say "is-userspace (fastbootd?): ${IS_USERSPACE:-no}"
 
 # ── if not already in fastbootd, try switching ───────────────────────────────
-# NOTE: 'is-logical:product' is only reliable from fastbootd, not bootloader
-# fastboot. Strategy: for any A/B device, always prefer fastbootd — it handles
-# both dynamic (logical) and physical partitions. For single-slot devices,
-# bootloader fastboot is fine.
+# Dynamic (logical) partitions require fastbootd to resize. Bootloader fastboot
+# cannot resize logical partitions and will fail with a cryptic error.
 if [ "${IS_USERSPACE:-no}" != "yes" ]; then
   echo ""
   echo "==> Not in fastbootd — attempting to switch (needed for dynamic partitions)..."
   if [ "$DRY_RUN" != "1" ]; then
     fastboot reboot fastboot 2>/dev/null || true
-    echo "  Waiting for fastbootd..."
-    fastboot wait-for-device 2>/dev/null || true
-    sleep 2
+    say "Waiting for fastbootd (up to 30 s)..."
+    _waited=0
+    until fastboot devices 2>/dev/null | grep -q "fastboot"; do
+      sleep 2; _waited=$(( _waited + 2 ))
+      [ "$_waited" -ge 30 ] && break
+    done
+    sleep 1  # give fastbootd a moment to finish initialising
   fi
   IS_USERSPACE="$(fastboot getvar is-userspace 2>&1 | grep '^is-userspace:' | awk '{print $2}' || true)"
   if [ "${IS_USERSPACE:-no}" = "yes" ]; then
-    echo "  Now in fastbootd."
+    say "Now in fastbootd."
   else
-    echo "  Device does not support fastbootd — staying in bootloader fastboot."
-    echo "  (This is normal for older Android devices with physical partitions.)"
+    say "Device does not support fastbootd — staying in bootloader fastboot."
+    say "(Normal for older devices with physical partitions.)"
   fi
 fi
 
@@ -127,8 +149,8 @@ SLOT_COUNT="$(fastboot getvar slot-count 2>&1 | grep '^slot-count:' | awk '{prin
 CURRENT_SLOT="$(fastboot getvar current-slot 2>&1 | grep '^current-slot:' | awk '{print $2}' || true)"
 [ -z "$SLOT_COUNT" ] && SLOT_COUNT="1"
 
-echo "  slot-count:    $SLOT_COUNT"
-echo "  current-slot:  ${CURRENT_SLOT:-(single-slot)}"
+say "slot-count:    $SLOT_COUNT"
+say "current-slot:  ${CURRENT_SLOT:-(single-slot)}"
 echo ""
 
 # ── determine what to flash ───────────────────────────────────────────────────
@@ -142,37 +164,49 @@ fi
 
 echo "==> Flash plan:"
 case "$SLOTS_TO_FLASH" in
-  both)
-    say "Will flash: product_a  AND  product_b  (A/B device — flashing both slots)"
-    ;;
-  a|b)
-    say "Will flash: product_$SLOTS_TO_FLASH  (forced slot)"
-    ;;
-  single)
-    say "Will flash: product  (single-slot device)"
-    ;;
+  both)   say "Will flash: product_a  AND  product_b  (A/B device — flashing both slots)" ;;
+  a|b)    say "Will flash: product_$SLOTS_TO_FLASH  (forced slot)" ;;
+  single) say "Will flash: product  (single-slot device)" ;;
 esac
 echo ""
 
 if [ "$DRY_RUN" = "1" ]; then
-  echo "  [DRY-RUN mode — nothing will actually be flashed]"
+  say "[DRY-RUN mode — nothing will actually be flashed]"
   echo ""
 fi
 
+# ── flash helper — aborts before slot B if slot A fails ──────────────────────
+_flash_partition() {
+  local part="$1"
+  echo "  Running: fastboot flash $part $IMG"
+  fastboot flash "$part" "$IMG" || die "Flash failed for partition '$part'.
+  The device has NOT been rebooted — it is still safe.
+  Retry manually: fastboot flash $part $IMG
+  If this keeps failing, re-flash the full stock ROM to recover."
+}
+
 # ── flash ─────────────────────────────────────────────────────────────────────
 echo "==> Flashing..."
-case "$SLOTS_TO_FLASH" in
-  both)
-    run fastboot flash product_a "$IMG"
-    run fastboot flash product_b "$IMG"
-    ;;
-  a|b)
-    run fastboot flash "product_$SLOTS_TO_FLASH" "$IMG"
-    ;;
-  single)
-    run fastboot flash product "$IMG"
-    ;;
-esac
+if [ "$DRY_RUN" = "1" ]; then
+  case "$SLOTS_TO_FLASH" in
+    both)   run fastboot flash product_a "$IMG"; run fastboot flash product_b "$IMG" ;;
+    a|b)    run fastboot flash "product_$SLOTS_TO_FLASH" "$IMG" ;;
+    single) run fastboot flash product "$IMG" ;;
+  esac
+else
+  case "$SLOTS_TO_FLASH" in
+    both)
+      _flash_partition product_a
+      _flash_partition product_b
+      ;;
+    a|b)
+      _flash_partition "product_$SLOTS_TO_FLASH"
+      ;;
+    single)
+      _flash_partition product
+      ;;
+  esac
+fi
 
 echo ""
 echo "==> Rebooting device..."
@@ -181,6 +215,9 @@ run fastboot reboot
 echo ""
 echo "========================================================"
 echo "  Done! Device is rebooting."
-echo "  First boot may take 2-5 minutes — Android is optimizing"
+echo "  First boot may take 2-5 minutes — Android is optimising"
 echo "  the newly installed system apps. This is normal."
+echo "  Log saved: $LOGFILE"
 echo "========================================================"
+
+wait 2>/dev/null || true

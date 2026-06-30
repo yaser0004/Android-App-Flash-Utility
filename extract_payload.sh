@@ -20,6 +20,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+# ── logging ───────────────────────────────────────────────────────────────────
+LOG_DIR="$HERE/Logs"
+mkdir -p "$LOG_DIR"
+LOGFILE="$LOG_DIR/Logs_$(date '+%d-%m-%Y_%H:%M:%S').txt"
+exec > >(tee "$LOGFILE") 2>&1
+
 # When run via sudo, HOME becomes /root — resolve the real user's home too
 REAL_HOME="$HOME"
 if [ -n "${SUDO_USER:-}" ]; then
@@ -50,6 +56,7 @@ done
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo "  $*"; }
 
+echo "  Log: $LOGFILE"
 echo ""
 echo "========================================================"
 echo "  extract_payload.sh"
@@ -58,12 +65,10 @@ echo ""
 
 # ── step 1: find source file ──────────────────────────────────────────────────
 if [ -z "$SOURCE" ]; then
-  # Prefer payload.bin if it exists
   if [ -f "$PAYLOAD_DIR/payload.bin" ]; then
     SOURCE="$PAYLOAD_DIR/payload.bin"
     say "Found: $SOURCE"
   else
-    # Look for a zip file
     _zip=""
     _newest=0
     for _f in "$PAYLOAD_DIR"/*.zip; do
@@ -84,6 +89,12 @@ fi
 [ -n "$SOURCE" ] || die "No payload.bin or ROM zip found in $PAYLOAD_DIR/
   Place your ROM zip or payload.bin in the payload/ folder and re-run."
 [ -f "$SOURCE" ] || die "File not found: $SOURCE"
+
+# Quick sanity check — a zero-byte or tiny file is certainly wrong
+_src_sz="$(stat -c %s "$SOURCE" 2>/dev/null || echo 0)"
+[ "$_src_sz" -gt 1048576 ] \
+  || die "Source file is suspiciously small (${_src_sz} bytes): $SOURCE
+  The ROM zip or payload.bin may be incomplete or corrupt."
 
 echo ""
 
@@ -151,10 +162,24 @@ if [ -f "$INPUT_DIR/product.img" ]; then
   say "Note: overwriting existing $INPUT_DIR/product.img"
 fi
 
-"$DUMPER" --images product --out "$INPUT_DIR" "$SOURCE"
+# Remove any partial file from a previous failed run before extracting
+rm -f "$INPUT_DIR/product.img.tmp" 2>/dev/null || true
+
+"$DUMPER" --images product --out "$INPUT_DIR" "$SOURCE" \
+  || die "payload_dumper failed to extract product.img.
+  The ROM file may be corrupt or an unsupported format. Try re-downloading."
 
 [ -f "$INPUT_DIR/product.img" ] \
   || die "product.img was not produced — check payload_dumper output above."
+
+# Verify the extracted image is a real ext4 filesystem
+if command -v tune2fs >/dev/null 2>&1; then
+  tune2fs -l "$INPUT_DIR/product.img" >/dev/null 2>&1 \
+    || die "Extracted product.img does not appear to be a valid ext4 filesystem.
+  The ROM zip may be corrupted or the product partition uses an unsupported format.
+  Try re-downloading the ROM."
+  say "product.img: valid ext4 filesystem confirmed"
+fi
 say "product.img: $(du -h "$INPUT_DIR/product.img" | cut -f1)"
 
 echo ""
@@ -166,9 +191,10 @@ echo "==> Extracting vbmeta images → $OUTPUT_DIR/ ..."
 "$DUMPER" --images vbmeta,vbmeta_system --out "$OUTPUT_DIR" "$SOURCE" 2>&1 \
   | grep -v "^$" | sed 's/^/  /' || true
 
-# If vbmeta_system wasn't produced, try vbmeta alone (some payloads only have vbmeta)
+# If vbmeta_system wasn't produced, try vbmeta alone
 if [ ! -f "$OUTPUT_DIR/vbmeta.img" ]; then
-  "$DUMPER" --images vbmeta --out "$OUTPUT_DIR" "$SOURCE"
+  "$DUMPER" --images vbmeta --out "$OUTPUT_DIR" "$SOURCE" \
+    || die "payload_dumper failed to extract vbmeta.img."
 fi
 
 [ -f "$OUTPUT_DIR/vbmeta.img" ] \
@@ -202,5 +228,8 @@ echo ""
 echo "    2. Add your APKs to product/app/ and product/priv-app/"
 echo "    3. sudo bash inject_apps.sh"
 echo "    4. bash flash_product.sh"
+echo "  Log saved: $LOGFILE"
 echo "========================================================"
 echo ""
+
+wait 2>/dev/null || true
