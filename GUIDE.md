@@ -116,7 +116,9 @@ FLASHING/
 ├── input/                        ← stock image extracted from ROM (never modified)
 │   └── product.img
 │
-└── output/                       ← generated files (recreated every inject run)
+├── output/                       ← generated files (recreated every inject run)
+│
+└── Logs/                         ← one log file per script run (gitignored)
     ├── product.img               ← modified partition image, ready to flash
     ├── vbmeta.img                ← extracted from ROM (flash once to disable AVB)
     └── vbmeta_system.img         ← same (only present if the ROM includes it)
@@ -299,16 +301,20 @@ sudo bash inject_apps.sh
 
 The script does all of this in order:
 1. Detects your device's CPU ABI list via `adb shell getprop ro.product.cpu.abilist`
-2. Copies `input/product.img` → `output/product.img` (every run starts fresh)
-3. Mounts `output/product.img` read-only and calculates how much space the new apps require
-4. Grows the partition image if needed (see Part 5)
-5. Remounts read-write and injects every app folder from `product/`
-6. For each APK, pre-extracts native `.so` libraries alongside it (required because `/product` is read-only at runtime — Android cannot extract them itself)
-7. Sets correct ownership (`root:root`), permissions (`0755` dirs / `0644` files), and SELinux labels (`u:object_r:system_file:s0`) on everything injected
-8. Unmounts cleanly
+2. Validates `input/product.img` is a real ext4 filesystem before touching it
+3. Copies `input/product.img` → `output/product.img` (every run starts fresh)
+4. Mounts `output/product.img` read-only and calculates how much space the new apps require
+5. Grows the partition image if needed (see Part 5)
+6. Remounts read-write and injects every app folder from `product/`
+7. For each APK, pre-extracts native `.so` libraries alongside it (required because `/product` is read-only at runtime — Android cannot extract them itself)
+8. Sets correct ownership (`root:root`), permissions (`0755` dirs / `0644` files), and SELinux labels (`u:object_r:system_file:s0`) on everything injected
+9. Unmounts cleanly and saves a log to `Logs/`
+
+**Safety:** If anything goes wrong mid-injection (out of space, tool error, Ctrl+C), the script removes the incomplete `output/product.img` automatically so you can never accidentally flash a half-injected image.
 
 You'll see output like this:
 ```
+  Log: /path/to/FLASHING/Logs/Logs_30-06-2026_14:30:00.txt
   ABI detected from connected device: arm64-v8a armeabi-v7a armeabi
 
 ==> Preparing output image...
@@ -318,7 +324,7 @@ You'll see output like this:
 ==> Checking space requirements...
   Net new data needed : 450 MB
   Free space in image : 580 MB
-  Sufficient space — no resize needed
+  Sufficient space (580 MB free, need 450 MB + 80 MB buffer) — no resize needed
 
 Mounted output/product.img → /mnt/product_edit
 
@@ -334,6 +340,7 @@ Mounted output/product.img → /mnt/product_edit
 ==> Done. Unmounted cleanly.
     Installed : 3 apps
     Skipped   : 1 apps (ABI-incompatible)
+    Log saved : Logs/Logs_30-06-2026_14:30:00.txt
 ```
 
 **What `(none)` means for ABI:** The APK contains no native code — it is pure Java/Kotlin and runs on any CPU. This is fine.
@@ -436,17 +443,19 @@ The script detects this before it happens and grows the image automatically. **Y
 **What the script does:**
 1. Pre-scans all app folders and calculates the total net new bytes needed (accounting for apps already in the image)
 2. Adds an 80 MB safety buffer
-3. If that total exceeds available free space: runs `truncate` (extends the file), then `e2fsck -f -p` (repairs the filesystem metadata), then `resize2fs` (expands the filesystem to fill the new size)
+3. If that total exceeds available free space — or if the image is already 100% full (common with GAPPS ROMs that ship with Google apps pre-installed) — runs `truncate` (extends the file), then `e2fsck -f -p` (repairs filesystem metadata), then `resize2fs` (expands the filesystem to fill the new size). Any tool failure here is fatal — the script will not proceed with a partially grown image.
 4. When you flash with `flash_product.sh`, fastbootd resizes the on-device logical partition to match the new image size automatically
 
 You'll see:
 ```
-==> Auto-growing image by 128 MB...
-  Image is now 1.4G
+==> Auto-growing image by 128 MB (host has 45G free)...
+  Image is now 1.6G
 ```
 
+**GAPPS ROMs:** If you are using a ROM that ships with Google apps (the `product` partition is 100% full out of the box), the script will still grow the image correctly — it treats a genuinely-full filesystem the same as any other space deficit.
+
 **Why this works at the device level:**
-`/product` is a *logical* partition living inside a larger block device called `super`. Logical partitions can be dynamically resized up to however much unallocated space remains in `super`. On most custom ROMs, `super` has 500 MB–1.5 GB of headroom available. If you somehow exceed that, the flash will fail — but this is unlikely unless you are injecting an unusually large number of very large apps.
+`/product` is a *logical* partition living inside a larger block device called `super`. Logical partitions can be dynamically resized up to however much unallocated space remains in `super`. The ceiling varies by device — run `fastboot getvar partition-size:super` to see the total super size. If you exceed available headroom, the flash will fail with a resize error (the device is still safe; just re-flash the stock ROM).
 
 **Incremental builds:**
 To build on top of a previous output (instead of always starting from the stock baseline), copy the output image back to input before running inject again:
@@ -501,14 +510,16 @@ Two likely causes:
 2. **ABI mismatch** — the APK's native code is compiled only for an architecture your device doesn't have (e.g., x86-only on an ARM phone). Get a universal or arm64 build of the app.
 
 **Phone bootloops after flashing**
-The injected image is likely corrupt or ran out of space during injection. Re-extract a clean baseline and retry:
+First: did `flash_product.sh` report success? If `inject_apps.sh` failed or was interrupted, it removes the incomplete output image automatically — `flash_product.sh` will then refuse to run with "Image not found". If that happened, just re-run inject and try again; there is no bad image on the device.
+
+If `flash_product.sh` did succeed but the phone bootloops, the image was injected but contains something the device rejects. Re-extract a clean baseline and re-inject, removing whichever app was likely the cause:
 ```bash
 bash extract_payload.sh
-# If space was the issue, remove some large APKs from product/ first
+# Remove the suspected APK from product/ first, then:
 sudo bash inject_apps.sh
 bash flash_product.sh
 ```
-If it still bootloops, boot into recovery and do a factory reset, then re-flash the ROM cleanly before trying again.
+If it still bootloops after removing all injected apps, boot into recovery and do a factory reset, then re-flash the ROM cleanly.
 
 **First boot takes longer than 10 minutes**
 Give it up to 15 minutes on slower devices or if you injected many large apps. If it truly never finishes, hold Power for 10 seconds to force reboot — Android will typically boot normally on the second attempt, having already optimized most apps during the first failed attempt.
