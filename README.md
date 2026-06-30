@@ -29,6 +29,39 @@ ROM zip ──[extract_payload.sh]──► input/product.img   (stock, never mo
 
 ---
 
+## Getting the scripts
+
+**Clone (recommended — clones the repo and installs all dependencies in one go):**
+```bash
+git clone https://github.com/yaser0004/Android-App-Flash-Utility.git && cd Android-App-Flash-Utility && bash -c '
+  pkgs=""
+  command -v adb       >/dev/null 2>&1 || pkgs="$pkgs android-tools-adb"
+  command -v fastboot  >/dev/null 2>&1 || pkgs="$pkgs android-tools-fastboot"
+  command -v python3   >/dev/null 2>&1 || pkgs="$pkgs python3"
+  command -v unzip     >/dev/null 2>&1 || pkgs="$pkgs unzip"
+  command -v resize2fs >/dev/null 2>&1 || pkgs="$pkgs e2fsprogs"
+  [ -z "$pkgs" ] && echo "All dependencies already installed." && exit 0
+  echo "Installing:$pkgs"
+  sudo apt-get install -y $pkgs
+'
+```
+
+**Download as a zip (no git required):**
+```bash
+curl -L https://github.com/yaser0004/Android-App-Flash-Utility/archive/refs/heads/main.zip -o Android-App-Flash-Utility.zip
+unzip Android-App-Flash-Utility.zip
+cd Android-App-Flash-Utility-main
+```
+
+**wget alternative:**
+```bash
+wget https://github.com/yaser0004/Android-App-Flash-Utility/archive/refs/heads/main.zip -O Android-App-Flash-Utility.zip
+unzip Android-App-Flash-Utility.zip
+cd Android-App-Flash-Utility-main
+```
+
+---
+
 ## Requirements
 
 ### Linux PC
