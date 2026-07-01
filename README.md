@@ -33,7 +33,8 @@ ROM zip ──[extract_payload.sh]──► input/product.img   (stock, never mo
 
 **Clone (recommended — clones the repo and installs all dependencies in one go):**
 ```bash
-git clone https://github.com/yaser0004/Android-App-Flash-Utility.git && cd Android-App-Flash-Utility && bash -c '
+git clone https://github.com/yaser0004/Android-App-Flash-Utility.git && cd Android-App-Flash-Utility && bash -c
+'
   pkgs=""
   command -v adb       >/dev/null 2>&1 || pkgs="$pkgs android-tools-adb"
   command -v fastboot  >/dev/null 2>&1 || pkgs="$pkgs android-tools-fastboot"

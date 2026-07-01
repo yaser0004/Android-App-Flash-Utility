@@ -25,6 +25,7 @@ LOG_DIR="$HERE/Logs"
 mkdir -p "$LOG_DIR"
 LOGFILE="$LOG_DIR/Logs_$(date '+%d-%m-%Y_%H:%M:%S').txt"
 exec > >(tee "$LOGFILE") 2>&1
+TEE_PID=$!
 
 # When run via sudo, HOME becomes /root — resolve the real user's home too
 REAL_HOME="$HOME"
@@ -232,4 +233,6 @@ echo "  Log saved: $LOGFILE"
 echo "========================================================"
 echo ""
 
-wait 2>/dev/null || true
+# Close the pipe to tee so it can exit, then wait for it
+exec >&- 2>&-
+wait "$TEE_PID" 2>/dev/null || true

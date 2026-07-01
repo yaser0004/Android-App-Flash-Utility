@@ -26,6 +26,7 @@ LOG_DIR="$HERE/Logs"
 mkdir -p "$LOG_DIR"
 LOGFILE="$LOG_DIR/Logs_$(date '+%d-%m-%Y_%H:%M:%S').txt"
 exec > >(tee "$LOGFILE") 2>&1
+TEE_PID=$!
 
 # ── defaults (overridable via flags) ─────────────────────────────────────────
 INPUT_IMG="$HERE/input/product.img"
@@ -262,8 +263,12 @@ _cleanup() {
   local _ec=$?
   umount "$MNT" 2>/dev/null || true
   # Wait for the tee log process to flush before exiting
-  wait 2>/dev/null || true
+  # Close the pipe to tee so it can exit, then wait for it
+  exec >&- 2>&-
+  wait "$TEE_PID" 2>/dev/null || true
   if [ "$INJECT_SUCCESS" = "0" ] && [ "$_ec" -ne 0 ]; then
+    # Reopen stderr to the terminal so abort messages are visible
+    exec 2>/dev/tty || true
     echo "" >&2
     echo "  ABORTED (exit $_ec) — removing incomplete output image to prevent a bad flash." >&2
     rm -f "$OUTPUT_IMG" 2>/dev/null || true
