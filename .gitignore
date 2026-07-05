@@ -10,6 +10,10 @@ output/*
 # ── APKs (user-provided, third-party binaries, too large for git) ─────────────
 product/**/*.apk
 
+# ── Generated per-device protection XMLs (device/app-specific, not portable) ──
+product/etc/permissions/*.xml
+!product/etc/permissions/.gitkeep
+
 # ── Build artifacts ───────────────────────────────────────────────────────────
 
 # ── Python cache ──────────────────────────────────────────────────────────────

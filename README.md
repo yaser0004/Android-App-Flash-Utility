@@ -132,13 +132,20 @@ cp ~/Downloads/<App_Name>.apk product/app/<App_Name>/<App_Name>.apk
 ```
 
 
-#### 4. Inject into the image (requires root for loop-mounting ext4)
+#### 4. (Optional) Make an app impossible to disable
+```bash
+bash protect_app.sh --apk-dir product/priv-app/<App_Name>
+```
+##### → greys out its Disable button in Settings — see [GUIDE.md](GUIDE.md) for how this works and its limits
+
+
+#### 5. Inject into the image (requires root for loop-mounting ext4)
 ```bash
 sudo bash inject_apps.sh
 ```
 
 
-#### 5. Flash to phone — auto-detects fastbootd, A/B slots, reboots device
+#### 6. Flash to phone — auto-detects fastbootd, A/B slots, reboots device
 ```bash
 bash flash_product.sh
 ```
@@ -176,6 +183,8 @@ Use `priv-app/` for apps that need privileged system permissions (app stores, VP
 
 ```
 extract_payload.sh          — STEP 1: extract product.img + vbmeta from ROM zip
+protect_app.sh              — OPTIONAL: mark an app's Disable button permanently
+                              greyed out in Settings (run before inject_apps.sh)
 inject_apps.sh              — STEP 2: inject APKs, fix permissions + SELinux xattrs,
                               pre-extract native libs, auto-grow partition if needed
 flash_product.sh            — STEP 3: flash to device (handles fastbootd, A/B slots,

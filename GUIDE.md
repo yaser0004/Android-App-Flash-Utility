@@ -100,6 +100,7 @@ FLASHING/
 ├── GUIDE.md                      ← you are here
 │
 ├── extract_payload.sh            ← STEP 1: extract images from ROM zip
+├── protect_app.sh                ← OPTIONAL: mark an app non-disableable in Settings
 ├── inject_apps.sh                ← STEP 2: inject APKs into product.img
 ├── flash_product.sh              ← STEP 3: flash product.img to your phone
 │
@@ -288,6 +289,31 @@ cp ~/Downloads/<AppName>-new-version.apk product/app/<AppName>/<AppName>.apk
 rm -rf product/app/<AppName>
 # The next inject run will not include it
 ```
+
+---
+
+### Optional — Make an app impossible to disable (`protect_app.sh`)
+
+By default, an injected system app still shows a normal, clickable "Disable" button in Settings → Apps → *App info*. `protect_app.sh` marks a specific app so that button is permanently greyed out, using the same mechanism Android itself uses to protect things like the default dialer, SMS app, and WebView provider from being disabled.
+
+Run this any time before Step 4, for any app already sitting in `product/app/` or `product/priv-app/`:
+
+```bash
+bash protect_app.sh --apk-dir product/priv-app/<AppName>
+```
+
+It extracts the app's real package name from the APK (via `aapt`) and writes `product/etc/permissions/prevent-disable-<package>.xml` — a file `inject_apps.sh` already picks up automatically, no changes to that script needed. If the APK isn't in the tree yet, use `--package com.example.app` instead (it warns, but doesn't fail, if no matching APK is found — the entry stays inert until the app is actually shipped as a system app).
+
+**How this works, precisely (so you know its real limits):** the tag is `<prevent-disable package="...">`, parsed by AOSP's `SystemConfig` from any `etc/sysconfig/` or `etc/permissions/` file on a system partition. Settings reads this list to decide whether to grey its own Disable button. This was verified directly against this device — the Settings.apk was pulled and decompiled, confirming the exact code path is present and unmodified from stock AOSP.
+
+**What it protects against:** the Settings app UI and the normal in-app disable flow.
+**What it does *not* protect against:** it is not enforced by `PackageManagerService` itself, so a direct `adb shell pm disable-user <package>` still works. This is a Settings-UI-level protection, not a framework-level one — that's a deliberate, verified distinction, not an oversight.
+
+Only apps shipped as system apps (anything under `product/app/` or `product/priv-app/` already qualifies) are affected — the check is skipped entirely for regular user-installed apps.
+
+**Bonus check — "Clear data":** the script also inspects (read-only) whether the APK's own manifest already blocks the "Clear storage" button, via `android:allowClearUserData="false"` on `<application>`. Unlike Disable, this isn't something an external config file can control — it's compiled into the APK itself. The script only reports the current state (`blocked` / `NOT blocked`); if you want it blocked and it isn't, add that attribute to your app's own `AndroidManifest.xml` and rebuild the APK — there's no way to patch a prebuilt APK for this without decompiling, editing, and re-signing it (out of scope here, and re-signing a third-party APK can break things like signature-based feature checks).
+
+**Not covered — "Force stop":** there is no build-time equivalent for this button. AOSP's `AppForceStopRepository` only restricts it for active Device Admins or via the device-wide `DISALLOW_APPS_CONTROL` restriction (Device/Profile Owner only, and it would affect every app on the device, not just one). Force Stop is deliberately left permissive in AOSP as a safety valve — nothing in this toolkit can change that.
 
 ---
 
@@ -563,6 +589,12 @@ cp /tmp/app/*.apk product/app/<AppName>/
 
 # Update:  cp new-version.apk product/app/<AppName>/<AppName>.apk
 # Remove:  rm -rf product/app/<AppName>
+
+# ── OPTIONAL: MAKE AN APP NON-DISABLEABLE ────────────────────────────────────
+
+bash protect_app.sh --apk-dir product/priv-app/<AppName>
+# greys the Disable button in Settings — Settings-UI-level only, not adb-proof
+# also reports (read-only) whether Clear Data is already blocked in the manifest
 
 # ── INJECT + FLASH ───────────────────────────────────────────────────────────
 
